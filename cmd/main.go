@@ -11,19 +11,23 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/lccmrx/rinha-bank/cmd/lock"
 )
 
 var (
-	err    error
-	db     *pgxpool.Pool
-	dbOnce sync.Once
+	ctx       context.Context
+	err       error
+	db        *pgxpool.Pool
+	dbOnce    sync.Once
+	clientMem = make(map[string]client)
+	mlock     lock.MultipleLock
 )
 
 type (
 	client struct {
 		ID      int `json:"-" db:"id"`
-		Balance int `json:"saldo" db:"balance"`
 		Limit   int `json:"limite" db:"limit"`
+		Balance int `json:"saldo" db:"balance"`
 	}
 
 	transaction struct {
@@ -54,6 +58,8 @@ type (
 
 func init() {
 
+	ctx = context.Background()
+
 	dbOnce.Do(func() {
 		connStr := fmt.Sprintf("postgresql://%s:%s@%s:%s/postgres?sslmode=disable",
 			"postgres",         // user
@@ -62,11 +68,29 @@ func init() {
 			"5432",             // port
 		)
 
-		db, err = pgxpool.New(context.Background(), connStr)
+		db, err = pgxpool.New(ctx, connStr)
 		if err != nil {
 			panic(err)
 		}
 	})
+
+	rows, err := db.Query(ctx, "SELECT id, \"limit\" FROM client")
+	if err != nil {
+		panic(err)
+	}
+
+	for rows.Next() {
+		var client client
+		rows.Scan(&client.ID, &client.Limit)
+		if err != nil {
+			panic(err)
+		}
+
+		clientMem[fmt.Sprintf("%d", client.ID)] = client
+	}
+
+	mlock = lock.NewMultipleLock()
+
 }
 
 func main() {
@@ -94,8 +118,8 @@ func getStatment() http.Handler {
 
 		fmt.Println(rId, "before-select-balance", time.Since(start))
 
-		var client client
-		err = db.QueryRow(ctx, "SELECT balance, \"limit\" FROM client WHERE id = $1", id).Scan(&client.Balance, &client.Limit)
+		var balance int
+		err = db.QueryRow(ctx, fmt.Sprintf("SELECT balance FROM balance%s ORDER BY timestamp DESC", id)).Scan(&balance)
 		if err != nil {
 			fmt.Println(2, err)
 			w.WriteHeader(500)
@@ -103,7 +127,7 @@ func getStatment() http.Handler {
 		}
 
 		fmt.Println(rId, "before-select-last-10-transactions", time.Since(start))
-		rows, err := db.Query(ctx, "SELECT client_id, type, value, description, timestamp FROM transaction WHERE client_id = $1 order by timestamp desc limit 10", id)
+		rows, err := db.Query(ctx, fmt.Sprintf("SELECT type, value, description, timestamp FROM transaction%s order by timestamp desc limit 10", id))
 		if err != nil {
 			fmt.Println(3, err)
 			w.WriteHeader(500)
@@ -117,7 +141,6 @@ func getStatment() http.Handler {
 		for rows.Next() {
 			var transaction transaction
 			err = rows.Scan(
-				&transaction.ClientID,
 				&transaction.Type,
 				&transaction.Value,
 				&transaction.Description,
@@ -139,8 +162,8 @@ func getStatment() http.Handler {
 
 		statement := statement{
 			Balance: statementBalance{
-				Total:         client.Balance,
-				Limit:         client.Limit,
+				Total:         balance,
+				Limit:         clientMem[id].Limit,
 				StatementDate: time.Now(),
 			},
 			LastTransactions: statementTxs,
@@ -193,43 +216,39 @@ func saveTransaction() http.Handler {
 			return
 		}
 
-		fmt.Println(rId, "before-begin-tx", time.Since(start))
-
-		tx, err := db.Begin(ctx)
-		if err != nil {
-			w.WriteHeader(500)
-			return
-		}
-		defer tx.Rollback(ctx)
-
+		mlock.Lock(any(id))
+		defer mlock.Unlock(any(id))
 		fmt.Println(rId, "before-select-balance", time.Since(start))
 
-		var client client
-		err = tx.QueryRow(ctx, "SELECT balance, \"limit\" FROM client WHERE id = $1 FOR UPDATE", id).Scan(&client.Balance, &client.Limit)
+		var balance int
+		err = db.QueryRow(ctx, fmt.Sprintf("SELECT balance FROM balance%s ORDER BY timestamp DESC", id)).Scan(&balance)
 		if err != nil {
+			fmt.Println(2, err)
 			w.WriteHeader(500)
 			return
 		}
 
-		fmt.Println(rId, "before-update", time.Since(start))
+		client := clientMem[id]
 		if transaction.Type == "c" {
-			tx.Exec(ctx, "UPDATE client SET balance = balance + $1 WHERE id = $2", transaction.Value, id)
+			balance += transaction.Value
 		}
 
 		if transaction.Type == "d" {
-			if client.Balance-transaction.Value < client.Limit*-1 {
+			if balance-transaction.Value < client.Limit*-1 {
 				w.WriteHeader(422)
 				return
 			}
-			tx.Exec(ctx, "UPDATE client SET balance = balance - $1 WHERE id = $2", transaction.Value, id)
+			balance -= transaction.Value
 		}
-		tx.Exec(ctx, "INSERT INTO transaction (client_id, type, description, value) VALUES ($1, $2, $3, $4)", id, transaction.Type, transaction.Description, transaction.Value)
+		fmt.Println(rId, "before-insert-balance-transaction", time.Since(start))
+		db.Exec(ctx, fmt.Sprintf("INSERT INTO balance%s (balance) values ($1)", id), balance)
+		db.Exec(ctx, fmt.Sprintf("INSERT INTO transaction%s (type, description, value) VALUES ($1, $2, $3)", id), transaction.Type, transaction.Description, transaction.Value)
 
+		client.Balance = balance
 		data, _ := json.Marshal(client)
 
 		w.WriteHeader(200)
 		w.Write(data)
 		fmt.Println(rId, "end", time.Since(start))
-		tx.Commit(ctx)
 	})
 }
