@@ -83,6 +83,7 @@ func getStatment() http.Handler {
 		ctx := r.Context()
 		rId := uuid.NewString()
 		start := time.Now()
+		fmt.Println(rId, "start", "statement", start)
 
 		id := r.PathValue("id")
 
@@ -91,20 +92,10 @@ func getStatment() http.Handler {
 			return
 		}
 
-		fmt.Println(rId, "before-begin-tx", time.Since(start))
-
-		tx, err := db.Begin(ctx)
-		if err != nil {
-			fmt.Println(1, err)
-			w.WriteHeader(500)
-			return
-		}
-		defer tx.Rollback(ctx)
-
 		fmt.Println(rId, "before-select-balance", time.Since(start))
 
 		var client client
-		err = tx.QueryRow(ctx, "SELECT balance, \"limit\" FROM client WHERE id = $1 FOR UPDATE", id).Scan(&client.Balance, &client.Limit)
+		err = db.QueryRow(ctx, "SELECT balance, \"limit\" FROM client WHERE id = $1", id).Scan(&client.Balance, &client.Limit)
 		if err != nil {
 			fmt.Println(2, err)
 			w.WriteHeader(500)
@@ -112,7 +103,7 @@ func getStatment() http.Handler {
 		}
 
 		fmt.Println(rId, "before-select-last-10-transactions", time.Since(start))
-		rows, err := tx.Query(ctx, "SELECT client_id, type, value, description, timestamp FROM transaction WHERE client_id = $1 order by timestamp desc limit 10", id)
+		rows, err := db.Query(ctx, "SELECT client_id, type, value, description, timestamp FROM transaction WHERE client_id = $1 order by timestamp desc limit 10", id)
 		if err != nil {
 			fmt.Println(3, err)
 			w.WriteHeader(500)
@@ -160,7 +151,7 @@ func getStatment() http.Handler {
 		w.WriteHeader(200)
 		w.Write(data)
 		fmt.Println(rId, "end", time.Since(start))
-		tx.Commit(ctx)
+		// tx.Commit(ctx)
 	})
 }
 
@@ -169,6 +160,7 @@ func saveTransaction() http.Handler {
 		ctx := r.Context()
 		rId := uuid.NewString()
 		start := time.Now()
+		fmt.Println(rId, "start", "transaction", start)
 
 		id := r.PathValue("id")
 
