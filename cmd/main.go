@@ -6,17 +6,16 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 var (
-	err    error
-	db     *pgxpool.Pool
-	dbOnce sync.Once
+	ctx       context.Context
+	err       error
+	db        *pgxpool.Pool
+	clientMem = make(map[string]*client)
 )
 
 type (
@@ -30,7 +29,7 @@ type (
 		ClientID    int       `json:"cliente_id" db:"client_id"`
 		Type        string    `json:"tipo" db:"type"`
 		Description string    `json:"descricao" db:"description"`
-		Value       int       `json:"valor" db:"value"`
+		Value       uint      `json:"valor" db:"value"`
 		Timestamp   time.Time `json:"timestamp" db:"timestamp"`
 	}
 
@@ -45,7 +44,7 @@ type (
 		StatementDate time.Time `json:"data_extrato"`
 	}
 	statementTransactions struct {
-		Value       int    `json:"valor"`
+		Value       uint   `json:"valor"`
 		Type        string `json:"tipo"`
 		Description string `json:"descricao"`
 		Timestamp   string `json:"realizada_em"`
@@ -53,25 +52,30 @@ type (
 )
 
 func init() {
+	ctx = context.Background()
 
-	dbOnce.Do(func() {
-		connStr := fmt.Sprintf("postgresql://%s:%s@%s:%s/postgres?sslmode=disable",
-			"postgres",         // user
-			"mysecretpassword", // password
-			"localhost",        // host
-			"5432",             // port
-		)
+	connStr := fmt.Sprintf("postgresql://%s:%s@%s:%s/postgres?sslmode=disable",
+		"postgres",         // user
+		"mysecretpassword", // password
+		"db",               // host
+		"5432",             // port
+	)
 
-		db, err = pgxpool.New(context.Background(), connStr)
-		if err != nil {
-			panic(err)
-		}
-	})
+	db, err = pgxpool.New(ctx, connStr)
+	if err != nil {
+		panic(err)
+	}
+
+	rows, _ := db.Query(ctx, "select id, \"limit\" from clients")
+	for rows.Next() {
+		var c client
+		rows.Scan(&c.ID, &c.Limit)
+		clientMem[fmt.Sprintf("%d", c.ID)] = &c
+	}
 }
 
 func main() {
 	r := http.NewServeMux()
-	defer db.Close()
 	r.Handle("GET /clientes/{id}/extrato", getStatment())
 	r.Handle("POST /clientes/{id}/transacoes", saveTransaction())
 
@@ -81,53 +85,27 @@ func main() {
 func getStatment() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
-		rId := uuid.NewString()
-		start := time.Now()
-		fmt.Println(rId, "start", "statement", start)
-
 		id := r.PathValue("id")
-
 		if id < "1" || id > "5" {
 			w.WriteHeader(404)
 			return
 		}
 
-		fmt.Println(rId, "before-select-balance", time.Since(start))
+		client := clientMem[id]
+		db.QueryRow(ctx, "SELECT balance FROM clients WHERE id = $1", id).Scan(&client.Balance)
 
-		var client client
-		err = db.QueryRow(ctx, "SELECT balance, \"limit\" FROM client WHERE id = $1", id).Scan(&client.Balance, &client.Limit)
-		if err != nil {
-			fmt.Println(2, err)
-			w.WriteHeader(500)
-			return
-		}
-
-		fmt.Println(rId, "before-select-last-10-transactions", time.Since(start))
-		rows, err := db.Query(ctx, "SELECT client_id, type, value, description, timestamp FROM transaction WHERE client_id = $1 order by timestamp desc limit 10", id)
-		if err != nil {
-			fmt.Println(3, err)
-			w.WriteHeader(500)
-			return
-		}
+		rows, _ := db.Query(ctx, "SELECT type, value, description, timestamp FROM transactions WHERE client_id = $1 order by timestamp desc limit 10", id)
 		defer rows.Close()
-
-		fmt.Println(rId, "before-transactions-row-scan", time.Since(start))
 
 		statementTxs := make([]statementTransactions, 0)
 		for rows.Next() {
 			var transaction transaction
 			err = rows.Scan(
-				&transaction.ClientID,
 				&transaction.Type,
 				&transaction.Value,
 				&transaction.Description,
 				&transaction.Timestamp,
 			)
-			if err != nil {
-				fmt.Println(4, err)
-				w.WriteHeader(500)
-				return
-			}
 
 			statementTxs = append(statementTxs, statementTransactions{
 				Value:       transaction.Value,
@@ -150,18 +128,12 @@ func getStatment() http.Handler {
 
 		w.WriteHeader(200)
 		w.Write(data)
-		fmt.Println(rId, "end", time.Since(start))
-		// tx.Commit(ctx)
 	})
 }
 
 func saveTransaction() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
-		rId := uuid.NewString()
-		start := time.Now()
-		fmt.Println(rId, "start", "transaction", start)
-
 		id := r.PathValue("id")
 
 		if id < "1" || id > "5" {
@@ -169,9 +141,8 @@ func saveTransaction() http.Handler {
 			return
 		}
 
+		var transaction *transaction
 		bodyBytes, _ := io.ReadAll(r.Body)
-
-		var transaction transaction
 		err = json.Unmarshal(bodyBytes, &transaction)
 		if err != nil {
 			w.WriteHeader(422)
@@ -183,53 +154,29 @@ func saveTransaction() http.Handler {
 			return
 		}
 
-		if transaction.Value < 1 {
+		if transaction.Value == 0 {
 			w.WriteHeader(422)
 			return
 		}
 
-		if transaction.Description == "" || len(transaction.Description) > 10 {
+		descLen := len(transaction.Description)
+		if descLen < 1 || descLen > 10 {
 			w.WriteHeader(422)
 			return
 		}
 
-		fmt.Println(rId, "before-begin-tx", time.Since(start))
-
-		tx, err := db.Begin(ctx)
-		if err != nil {
-			w.WriteHeader(500)
-			return
-		}
-		defer tx.Rollback(ctx)
-
-		fmt.Println(rId, "before-select-balance", time.Since(start))
-
-		var client client
-		err = tx.QueryRow(ctx, "SELECT balance, \"limit\" FROM client WHERE id = $1 FOR UPDATE", id).Scan(&client.Balance, &client.Limit)
-		if err != nil {
-			w.WriteHeader(500)
+		var balance *int
+		db.QueryRow(ctx, "call transact($1, $2, $3, $4)", id, transaction.Value, transaction.Type, transaction.Description).Scan(&balance)
+		if balance == nil {
+			w.WriteHeader(422)
 			return
 		}
 
-		fmt.Println(rId, "before-update", time.Since(start))
-		if transaction.Type == "c" {
-			tx.Exec(ctx, "UPDATE client SET balance = balance + $1 WHERE id = $2", transaction.Value, id)
-		}
-
-		if transaction.Type == "d" {
-			if client.Balance-transaction.Value < client.Limit*-1 {
-				w.WriteHeader(422)
-				return
-			}
-			tx.Exec(ctx, "UPDATE client SET balance = balance - $1 WHERE id = $2", transaction.Value, id)
-		}
-		tx.Exec(ctx, "INSERT INTO transaction (client_id, type, description, value) VALUES ($1, $2, $3, $4)", id, transaction.Type, transaction.Description, transaction.Value)
-
+		client := clientMem[id]
+		client.Balance = *balance
 		data, _ := json.Marshal(client)
 
 		w.WriteHeader(200)
 		w.Write(data)
-		fmt.Println(rId, "end", time.Since(start))
-		tx.Commit(ctx)
 	})
 }
