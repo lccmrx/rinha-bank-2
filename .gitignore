@@ -1,3 +1,5 @@
 load-test/user-files/results/
 
 server.logs
+
+*.csv

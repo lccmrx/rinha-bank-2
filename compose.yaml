@@ -24,6 +24,8 @@ services:
         condition: service_healthy
     # ports:
     #   - "9999:9999"
+    environment:
+      - port=9999
     deploy:
       resources:
         limits:
@@ -53,4 +55,3 @@ services:
         limits:
           cpus: "1.0"
           memory: "380MB"
-
