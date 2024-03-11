@@ -1,0 +1,50 @@
+syntax = "proto3";
+
+package transaction;
+
+import "google/protobuf/wrappers.proto";
+
+option go_package = "github.com/yourusername/yourproject/gen/pb;pb";
+
+// The transaction service definition.
+service TransactionService {
+  // Sends a transaction and gets the updated balance
+  rpc SendTransaction(TransactionRequest) returns (BalanceResponse) {}
+
+  // Gets the last 10 transactions for a client
+  rpc GetStatement(StatementRequest) returns (StatementResponse) {}
+}
+
+// The request message for sending a transaction.
+message TransactionRequest {
+  string userId = 1;
+  int64 amount = 2;          // Amount as an integer
+  string type = 3;  // Transaction type (credit or debit)
+  string description = 4;
+}
+
+// The response message containing the user's updated balance.
+message BalanceResponse {
+  google.protobuf.Int64Value balance = 1;
+  int64 limit = 2;
+}
+
+// The request message for getting a statement.
+message StatementRequest {
+  string userId = 1;
+}
+
+// A single transaction record.
+message TransactionRecord {
+  int64 amount = 1;          // Amount as an integer
+  string timestamp = 2;
+  string type = 3;  // Transaction type (credit or debit)
+  string description = 4;
+}
+
+// The response message containing the last 10 transactions.
+message StatementResponse {
+  int64 balance = 1;
+  int64 limit = 2;
+  repeated TransactionRecord transactions = 3;
+}

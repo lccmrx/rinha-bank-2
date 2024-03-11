@@ -1,4 +1,4 @@
-module github.com/lccmrx/rinha-bank
+module github.com/lccmrx/rinha-bank/api
 
 go 1.22.0
 
